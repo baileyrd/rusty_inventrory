@@ -14,7 +14,9 @@ No account, no server, no sync. The core library links no HTTP client at all.
 The capability review this was built from is in
 [`CAPABILITIES.md`](CAPABILITIES.md); the design decisions and the places this
 deliberately differs from the reviewed product are in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); where the reviewed product's
+own design falls short, and what a better version does, is in
+[`docs/CRITIQUE.md`](docs/CRITIQUE.md).
 
 ---
 
