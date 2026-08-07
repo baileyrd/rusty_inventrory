@@ -548,3 +548,149 @@ fn a_read_only_reopen_does_not_touch_the_sealed_file() {
         "a read-only open reencrypted the index; it should have left the sealed bytes alone"
     );
 }
+
+/// Build a git repository on disk with a remote and one real source file.
+fn git_repo(dir: &std::path::Path, remote: &str) {
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".git/config"),
+        format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {remote}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/auth.rs"), "// the file under discussion\n").unwrap();
+}
+
+/// The archaeology path end to end: a conversation recorded inside a checkout
+/// is resolved to that repository, the files it discussed are extracted, and
+/// the file can be asked what was said about it.
+#[test]
+fn a_conversation_is_attached_to_its_repository_and_files() {
+    let fx = Fixture::new();
+    let checkout = tempfile::tempdir().unwrap();
+    git_repo(checkout.path(), "git@github.com:acme/api.git");
+    let cwd = checkout.path().display().to_string();
+    let t = recent();
+
+    write(
+        root_for(SourceId::ClaudeCode).join("-acme-api/sess-repo.jsonl"),
+        &format!(
+            r#"{{"type":"user","sessionId":"sess-repo","cwd":"{cwd}","gitBranch":"main","timestamp":{t},"message":{{"role":"user","content":"the token refresh in src/auth.rs races the retry"}}}}
+{{"type":"assistant","timestamp":{t},"message":{{"role":"assistant","content":[{{"type":"text","text":"Moved the lock in src/auth.rs above the refresh, and left src/db.rs alone."}}]}}}}"#
+        ),
+    );
+
+    let mut inv = fx.open();
+    inv.index(false).unwrap();
+
+    let repos = inv.repos().unwrap();
+    assert_eq!(repos.len(), 1, "expected exactly one repo, got {repos:?}");
+    assert_eq!(repos[0].key, "git:github.com/acme/api");
+    assert_eq!(repos[0].name, "api");
+    assert_eq!(repos[0].conversations, 1);
+
+    // The file that exists on disk and was discussed twice.
+    let history = inv
+        .history_for_path(std::path::Path::new("src/auth.rs"), checkout.path(), 10)
+        .unwrap();
+    assert_eq!(history.path, "src/auth.rs");
+    assert_eq!(history.hits.len(), 1, "{history:?}");
+    assert_eq!(history.hits[0].mentions, 2);
+    assert!(history.hits[0].conversation.title.contains("token refresh"));
+
+    // A file mentioned once, which does not exist on disk — the history that
+    // matters most is exactly the history of files that have since gone.
+    let db = inv
+        .history_for_path(std::path::Path::new("src/db.rs"), checkout.path(), 10)
+        .unwrap();
+    assert_eq!(db.hits.len(), 1, "a deleted file should still have history");
+
+    // And a file nobody ever discussed.
+    let quiet = inv
+        .history_for_path(std::path::Path::new("src/quiet.rs"), checkout.path(), 10)
+        .unwrap();
+    assert!(quiet.hits.is_empty());
+}
+
+/// The same identity holds when the checkout moves, because conversations are
+/// grouped by remote rather than by path. This is the case a path-keyed index
+/// gets wrong, and the reason `repos.key` exists at all.
+#[test]
+fn a_moved_checkout_stays_one_repository() {
+    let fx = Fixture::new();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    git_repo(first.path(), "https://github.com/acme/api.git");
+    git_repo(second.path(), "git@github.com:acme/api.git");
+    let t = recent();
+
+    for (n, dir) in [(1, first.path()), (2, second.path())] {
+        let cwd = dir.display().to_string();
+        write(
+            root_for(SourceId::ClaudeCode).join(format!("-acme-api/sess-{n}.jsonl")),
+            &format!(
+                r#"{{"type":"user","sessionId":"sess-{n}","cwd":"{cwd}","timestamp":{t},"message":{{"role":"user","content":"working on src/auth.rs again"}}}}"#
+            ),
+        );
+    }
+
+    let mut inv = fx.open();
+    inv.index(false).unwrap();
+
+    let repos = inv.repos().unwrap();
+    assert_eq!(
+        repos.len(),
+        1,
+        "the same remote cloned twice should be one repo, got {repos:?}"
+    );
+    assert_eq!(repos[0].conversations, 2);
+}
+
+/// `--repo` and `--file` narrow a normal search, so the archaeology data also
+/// serves the search box it was built alongside.
+#[test]
+fn search_can_be_scoped_to_a_repository_and_a_file() {
+    let fx = Fixture::new();
+    let checkout = tempfile::tempdir().unwrap();
+    git_repo(checkout.path(), "git@github.com:acme/api.git");
+    let cwd = checkout.path().display().to_string();
+    let t = recent();
+
+    write(
+        root_for(SourceId::ClaudeCode).join("-acme-api/sess-scope.jsonl"),
+        &format!(
+            r#"{{"type":"user","sessionId":"sess-scope","cwd":"{cwd}","timestamp":{t},"message":{{"role":"user","content":"the retry loop in src/auth.rs never terminates"}}}}"#
+        ),
+    );
+    // A second conversation, same words, different project.
+    write(
+        root_for(SourceId::ClaudeCode).join("-other/sess-other.jsonl"),
+        &format!(
+            r#"{{"type":"user","sessionId":"sess-other","cwd":"/somewhere/else","timestamp":{t},"message":{{"role":"user","content":"the retry loop never terminates here either"}}}}"#
+        ),
+    );
+
+    let mut inv = fx.open();
+    inv.index(false).unwrap();
+
+    let mut all = SearchQuery::new("retry loop");
+    all.meaning = false;
+    assert_eq!(inv.search(&all).unwrap().hits.len(), 2);
+
+    let mut scoped = SearchQuery::new("retry loop");
+    scoped.meaning = false;
+    scoped.repo = Some("api".into());
+    let hits = inv.search(&scoped).unwrap().hits;
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].conversation.title.contains("retry loop"));
+
+    let mut by_file = SearchQuery::new("retry loop");
+    by_file.meaning = false;
+    by_file.file = Some("src/auth.rs".into());
+    assert_eq!(inv.search(&by_file).unwrap().hits.len(), 1);
+
+    let mut missing = SearchQuery::new("retry loop");
+    missing.meaning = false;
+    missing.repo = Some("no-such-repo".into());
+    assert!(inv.search(&missing).unwrap().hits.is_empty());
+}

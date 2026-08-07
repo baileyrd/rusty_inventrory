@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Marks the sealed container format, so a stray SQLite file — or an index
 /// written by a version of this app that used SQLCipher — is never mistaken
@@ -351,6 +351,38 @@ fn migrate(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- The repository a conversation happened in. `key` is a normalised
+        -- remote URL where there is one, so the same repo cloned to two paths
+        -- — or simply moved — stays one row. `root` is only the last place it
+        -- was seen and may no longer exist.
+        CREATE TABLE IF NOT EXISTS repos (
+            id     INTEGER PRIMARY KEY,
+            key    TEXT NOT NULL UNIQUE,
+            root   TEXT NOT NULL,
+            remote TEXT,
+            name   TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_repo (
+            conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            repo_id         INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            -- 'recorded' (the source knew the working directory) or
+            -- 'inferred' (it was reconstructed from paths in the transcript).
+            origin          TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conversation_repo_by_repo ON conversation_repo(repo_id);
+
+        -- Repo-relative paths a conversation mentioned, with how often. The
+        -- join that answers "what was I thinking when I wrote this".
+        CREATE TABLE IF NOT EXISTS conversation_file (
+            conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            repo_id         INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            path            TEXT    NOT NULL,
+            mentions        INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (conversation_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS conversation_file_lookup ON conversation_file(repo_id, path);
         "#,
     )?;
 

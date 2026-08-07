@@ -49,9 +49,26 @@ enum Command {
         /// Only conversations from the last N days.
         #[arg(long, value_name = "DAYS")]
         days: Option<i64>,
+        /// Restrict to one repository, by name or remote.
+        #[arg(long, value_name = "REPO")]
+        repo: Option<String>,
+        /// Restrict to conversations that touched this repo-relative path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
         #[arg(long)]
         json: bool,
     },
+    /// What was said about a file — the conversations that produced it.
+    Why {
+        /// A path, absolute or relative to the current directory.
+        path: std::path::PathBuf,
+        #[arg(long, short, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Repositories the index has conversations for.
+    Repos,
     /// Keep the index live: watch the source stores and index as they change.
     Watch {
         /// Seconds between stats of the source stores.
@@ -155,8 +172,22 @@ fn run() -> Result<()> {
             limit,
             no_meaning,
             days,
+            repo,
+            file,
             json,
-        } => cmd_search(&cli, query, source, *limit, !*no_meaning, *days, *json),
+        } => cmd_search(
+            &cli,
+            query,
+            source,
+            *limit,
+            !*no_meaning,
+            *days,
+            repo.as_deref(),
+            file.as_deref(),
+            *json,
+        ),
+        Command::Why { path, limit, json } => cmd_why(&cli, path, *limit, *json),
+        Command::Repos => cmd_repos(&cli),
         Command::Watch { interval, grace } => cmd_watch(&cli, *interval, *grace),
         Command::Sources => cmd_sources(&cli),
         Command::Show { id } => cmd_show(&cli, *id),
@@ -270,6 +301,8 @@ fn cmd_search(
     limit: usize,
     meaning: bool,
     days: Option<i64>,
+    repo: Option<&str>,
+    file: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let text = query.join(" ");
@@ -283,12 +316,144 @@ fn cmd_search(
     q.limit = limit;
     q.meaning = meaning;
     q.since = days.map(|d| inventory_core::model::now_unix() - d * 86_400);
+    q.repo = repo.map(str::to_string);
+    q.file = file.map(str::to_string);
 
     let response = inv.search(&q)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
         render::search_results(&response, &text);
+    }
+    Ok(())
+}
+
+fn cmd_why(cli: &Cli, path: &std::path::Path, limit: usize, json: bool) -> Result<()> {
+    let inv = open(cli)?;
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let history = inv.history_for_path(path, &cwd, limit)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "repo": history.repo.as_ref().map(|r| &r.key),
+                "path": history.path,
+                "conversations": history.hits.iter().map(|h| serde_json::json!({
+                    "id": h.conversation.id,
+                    "title": h.conversation.title,
+                    "source": h.conversation.source.slug(),
+                    "updated_at": h.conversation.updated_at,
+                    "mentions": h.mentions,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    let Some(repo) = &history.repo else {
+        println!(
+            "{}",
+            paint(
+                DIM,
+                "Not inside a repository, so there is nothing to look up."
+            )
+        );
+        return Ok(());
+    };
+
+    if history.hits.is_empty() {
+        println!(
+            "No indexed conversation mentions {} in {}.",
+            paint(BOLD, &history.path),
+            paint(ACCENT, &repo.name)
+        );
+        println!(
+            "{}",
+            paint(
+                DIM,
+                "Either nothing was discussed about it, or the conversations that did \
+                 predate the index."
+            )
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} in {}",
+        paint(BOLD, &history.path),
+        paint(ACCENT, &repo.name)
+    );
+    println!();
+    for hit in &history.hits {
+        let c = &hit.conversation;
+        println!(
+            "  {} {}",
+            paint(ACCENT, &format!("#{}", c.id)),
+            paint(BOLD, &c.title)
+        );
+        println!(
+            "     {}",
+            paint(
+                DIM,
+                &format!(
+                    "{} · {} · {} mention{}",
+                    c.source.display_name(),
+                    format::relative(c.updated_at),
+                    hit.mentions,
+                    if hit.mentions == 1 { "" } else { "s" }
+                )
+            )
+        );
+    }
+    println!();
+    println!(
+        "{}",
+        paint(
+            DIM,
+            "`inv show <id>` for the whole thread, `inv primer <id>` to hand it off."
+        )
+    );
+    Ok(())
+}
+
+fn cmd_repos(cli: &Cli) -> Result<()> {
+    let inv = open(cli)?;
+    let repos = inv.repos()?;
+    if repos.is_empty() {
+        println!(
+            "{}",
+            paint(
+                DIM,
+                "No repositories yet. Run `inv index` — conversations are attached to a \
+                 repository as they are indexed."
+            )
+        );
+        return Ok(());
+    }
+
+    for r in &repos {
+        println!(
+            "  {:<28} {}",
+            paint(BOLD, &r.name),
+            paint(
+                DIM,
+                &format!(
+                    "{} conversation{} · {} file{} · {}",
+                    r.conversations,
+                    if r.conversations == 1 { "" } else { "s" },
+                    r.files,
+                    if r.files == 1 { "" } else { "s" },
+                    format::relative(r.last_activity)
+                )
+            )
+        );
+        // The remote is what conversations are actually grouped by; showing
+        // the local root as well makes a moved checkout obvious.
+        match &r.remote {
+            Some(remote) => println!("  {:<28} {}", "", paint(DIM, remote)),
+            None => println!("  {:<28} {}", "", paint(DIM, &r.root.display().to_string())),
+        }
     }
     Ok(())
 }

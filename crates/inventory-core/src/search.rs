@@ -40,6 +40,10 @@ pub struct SearchQuery {
     pub meaning: bool,
     /// Unix-seconds lower bound on `updated_at`.
     pub since: Option<i64>,
+    /// Restrict to one repository, by `repos.key` or by name.
+    pub repo: Option<String>,
+    /// Restrict to conversations that touched this repo-relative path.
+    pub file: Option<String>,
 }
 
 impl SearchQuery {
@@ -50,6 +54,8 @@ impl SearchQuery {
             limit: 20,
             meaning: true,
             since: None,
+            repo: None,
+            file: None,
         }
     }
 }
@@ -125,27 +131,62 @@ fn source_filter(sources: &[SourceId]) -> String {
     format!(" AND c.source IN ({list})")
 }
 
+/// The non-text filters, as a SQL fragment plus the values it binds.
+///
+/// Source slugs come from a closed enum and are inlined; the repo and file
+/// names are user input and are bound, starting at `?{first}`. Both are
+/// `EXISTS` subqueries rather than joins so a conversation touching a file
+/// several times still produces one row.
+fn scope_clause(query: &SearchQuery, first: usize) -> (String, Vec<String>) {
+    let mut sql = source_filter(&query.sources);
+    let mut values = Vec::new();
+    let mut i = first;
+
+    if let Some(repo) = &query.repo {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM conversation_repo cr
+                            JOIN repos r ON r.id = cr.repo_id
+                           WHERE cr.conversation_id = c.id
+                             AND (r.key = ?{i} OR r.name = ?{i}))"
+        ));
+        values.push(repo.clone());
+        i += 1;
+    }
+    if let Some(file) = &query.file {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM conversation_file cf
+                           WHERE cf.conversation_id = c.id AND cf.path = ?{i})"
+        ));
+        values.push(file.clone());
+    }
+    (sql, values)
+}
+
 fn keyword_search(conn: &Connection, query: &SearchQuery) -> Result<Vec<(i64, String)>> {
     let run = |conjunctive: bool| -> Result<Vec<(i64, String)>> {
         let Some(expr) = build_match_expression(&query.text, conjunctive) else {
             return Ok(Vec::new());
         };
+        let (scope, scope_values) = scope_clause(query, 4);
         let sql = format!(
             "SELECT c.id,
                     snippet(conversations_fts, 1, '[', ']', '…', 14) AS snip
              FROM conversations_fts f
              JOIN conversations c ON c.id = f.rowid
              WHERE conversations_fts MATCH ?1
-               AND (?2 = 0 OR c.updated_at >= ?2){}
+               AND (?2 = 0 OR c.updated_at >= ?2){scope}
              ORDER BY bm25(conversations_fts, 4.0, 1.0)
-             LIMIT ?3",
-            source_filter(&query.sources)
+             LIMIT ?3"
         );
+        let since = query.since.unwrap_or(0);
+        let depth = CANDIDATE_DEPTH as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&expr, &since, &depth];
+        params.extend(scope_values.iter().map(|v| v as &dyn rusqlite::ToSql));
+
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params![expr, query.since.unwrap_or(0), CANDIDATE_DEPTH as i64],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         Ok(rows.flatten().collect())
     };
 
@@ -162,15 +203,22 @@ fn keyword_search(conn: &Connection, query: &SearchQuery) -> Result<Vec<(i64, St
 /// Conversations a source/recency filter permits, or `None` when everything
 /// is permitted — which is the common case, and skips the query entirely.
 fn allowed_ids(conn: &Connection, query: &SearchQuery) -> Result<Option<HashSet<i64>>> {
-    if query.sources.is_empty() && query.since.is_none() {
+    if query.sources.is_empty()
+        && query.since.is_none()
+        && query.repo.is_none()
+        && query.file.is_none()
+    {
         return Ok(None);
     }
-    let sql = format!(
-        "SELECT c.id FROM conversations c WHERE (?1 = 0 OR c.updated_at >= ?1){}",
-        source_filter(&query.sources)
-    );
+    let (scope, scope_values) = scope_clause(query, 2);
+    let sql =
+        format!("SELECT c.id FROM conversations c WHERE (?1 = 0 OR c.updated_at >= ?1){scope}");
+    let since = query.since.unwrap_or(0);
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&since];
+    params.extend(scope_values.iter().map(|v| v as &dyn rusqlite::ToSql));
+
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([query.since.unwrap_or(0)], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0))?;
     Ok(Some(rows.flatten().collect()))
 }
 

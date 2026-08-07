@@ -29,6 +29,7 @@ implementation.
 | `sources/*` | The six readers, plus the snapshot and VS Code-fork helpers. |
 | `embed/*` | On-device embedding: hashing fallback, locally-trained LSA, and the linear algebra behind it. |
 | `search` | BM25 + semantic retrieval, RRF fusion, meaning labelling. |
+| `repo` | Resolving a conversation to the repository and files it touched. |
 | `index` | The `Inventory` type: indexing, freeze/repair, retention, stats. |
 | `capture` | Quick capture and the clipboard scratchpad. |
 | `handoff` | Session resumption and hand-off primers. |
@@ -285,6 +286,48 @@ product's security page invites you to verify.
 once-a-day interval, version comparison — and defines an `UpdateTransport`
 trait the shell implements. This turns "the app makes no network calls" from a
 promise into something checkable with `cargo tree`.
+
+### Attaching conversations to code
+
+Every source records where a conversation was happening, as
+`Conversation::project_path`. On its own that is a string with somebody's home
+directory in it, so `repo.rs` turns it into two durable things: a repository
+identity, and the repo-relative paths the conversation discussed. This is what
+`inv why` reads, and it is a capability the reviewed product does not have —
+see [`CRITIQUE.md`](CRITIQUE.md#2-it-indexes-the-wrong-artifact) for why it is
+worth having.
+
+**Identity is the remote, not the path.** `repos.key` is a normalised origin
+URL, so `git@github.com:o/r.git` and `https://github.com/o/r` are one row, and
+a checkout that moves — or exists at different paths on two machines — does not
+fragment into several repositories. A repo with no remote falls back to its own
+path, which still groups correctly on the machine where the work happened, and
+a project that is not a git repository at all is keyed by path rather than
+dropped.
+
+**Git is read directly.** `.git/config` is an INI file and the only field
+wanted is a remote URL. Linking libgit2 to read one line would put a C
+toolchain back into a dependency graph that the sealing design went out of its
+way to keep pure Rust, and shelling out to `git` would make indexing depend on
+a binary that may not be installed. Worktrees and submodules — where `.git` is
+a file pointing at state elsewhere — are followed via `gitdir`/`commondir`.
+
+**File extraction is a heuristic, and is documented as one.** The tool-call
+arguments in these transcripts carry exact paths, but the source parsers
+flatten every message to text before the indexer sees it, so that structure is
+gone by the time `repo.rs` runs. What is left is scanning for path-shaped
+tokens: anything that resolves under the repository root on disk is taken, and
+anything else needs a recognised source extension. A bare filename with no
+directory is only accepted when it can be seen on disk, since otherwise every
+mention of `index.js` anywhere would collapse into one entry.
+
+Paths that no longer exist are kept deliberately. A file that was deleted or
+renamed is precisely the one whose history is hard to recover by any other
+means, and requiring files to exist would discard it.
+
+**Linking never fails an index pass.** A conversation that cannot be placed is
+still fully searchable by text. Trading the capability that works for the one
+that is a best effort would be the wrong way round.
 
 ---
 

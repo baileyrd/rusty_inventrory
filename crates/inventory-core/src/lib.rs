@@ -29,6 +29,7 @@ pub mod index;
 pub mod keychain;
 pub mod model;
 pub mod paths;
+pub mod repo;
 pub mod search;
 pub mod sources;
 pub mod update;
@@ -36,11 +37,14 @@ pub mod vectors;
 pub mod watch;
 
 pub use error::{Error, Result};
-pub use index::{IndexReport, Inventory, RetentionOption, SourceReport, Stats};
+pub use index::{
+    FileHistory, FileHit, IndexReport, Inventory, RepoSummary, RetentionOption, SourceReport, Stats,
+};
 pub use model::{
     Clip, Conversation, Message, Note, ParsedConversation, Retention, Role, SourceId, SourceState,
     SourceStatus,
 };
+pub use repo::{Origin, RepoRef};
 pub use search::{MatchedVia, SearchHit, SearchQuery, SearchResponse};
 pub use watch::{WatchTick, Watcher};
 

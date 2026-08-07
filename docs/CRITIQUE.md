@@ -161,7 +161,12 @@ see the platform row in
 
 ## What a better version does
 
-Three changes, in the order they earn their keep.
+Three changes, in the order they earn their keep. The second is now built —
+`repo.rs`, `inv why` and the `--repo`/`--file` search filters — and is
+described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#attaching-conversations-to-code). It is
+listed second here because that is where it belongs in the argument, not
+because it was done second.
 
 ### Expose the index to the agent
 
@@ -178,15 +183,19 @@ It also fits what already exists here. The core is a library with no network
 dependency and a CLI over it; an MCP server is a third front end over the same
 API, not a new subsystem.
 
-### Link conversations to the repository
+### Link conversations to the repository — *built*
 
 Resolve each conversation to the repo and files it touched, and index that
 alongside the text. Git already records what changed and when, and the
-conversation side of the join is partly in place: `Conversation::project_path`
-is populated today by the Claude Code, Codex and Zed parsers. Cursor, Kiro and
-Antigravity supply nothing, so those three need either a parser change or a
-fallback — inferring the repo from file paths mentioned in the transcript — and
-the feature has to degrade per source rather than assume the key is present.
+conversation side of the join is in place: every one of the six parsers
+populates `Conversation::project_path` — Claude Code, Codex and Zed from their
+own fields, and Cursor, Kiro and Antigravity through the shared `vscdb` reader,
+which takes `workspaceFolder`, `cwd` or `folder`.
+
+It is an `Option`, though, and how often it is actually present in a real store
+is unmeasured. The feature should degrade to text-only rather than assume the
+key is there, and a fallback that infers the repo from file paths mentioned in
+the transcript covers conversations that carry no path at all.
 
 That turns the query in §2 from an aspiration into a lookup: given a file or a
 commit, return the conversations that produced it. It is also the single

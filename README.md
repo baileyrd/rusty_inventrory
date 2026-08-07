@@ -38,12 +38,13 @@ category of product.
 
 ```bash
 cargo build --release          # core + CLI
-cargo test  --workspace        # 78 tests
+cargo test                     # 94 tests
 cargo build --release -p inventory-tauri
 ```
 
 The desktop crate is outside the workspace's `default-members`, so a plain
-`cargo build` and `cargo test` need no GUI toolkit.
+`cargo build` and `cargo test` need no GUI toolkit. `--workspace` overrides
+that and does need one, which is why the line above omits it.
 
 **macOS and Windows need nothing extra.** Linux needs GTK/WebKit for the
 desktop shell and libdbus for the keyring:
@@ -61,6 +62,8 @@ CI builds, lints and tests on all three platforms.
 inv index                        # read every installed tool
 inv watch                        # keep the index live as you work
 inv search "container stuck"     # keyword + meaning, across all six
+inv why src/auth.rs              # what was said about this file, and when
+inv repos                        # repositories the index has history for
 inv sources                      # per-source status, including anything frozen
 inv show 42                      # print a whole conversation
 inv resume 42                    # reopen it in Claude Code or Codex
@@ -73,8 +76,32 @@ inv doctor                       # verify encryption, embeddings, source health
 inv stats
 ```
 
-Search takes `--source`, `--limit`, `--days`, `--json`, and `--no-meaning`
-(the ⌘M toggle, off).
+Search takes `--source`, `--limit`, `--days`, `--repo`, `--file`, `--json`,
+and `--no-meaning` (the ⌘M toggle, off).
+
+### Asking a file what happened to it
+
+`inv why` answers the question the search box cannot: *why is this code like
+this?* Conversations are attached to the repository and the files they
+discussed as they are indexed, so a path is a way in.
+
+```console
+$ inv why crates/inventory-core/src/search.rs
+crates/inventory-core/src/search.rs in rusty_inventrory
+
+  #2 RRF blends BM25 with cosine — why fuse ranks instead of scores?
+     Claude Code · 3d ago · 2 mentions
+```
+
+Paths are resolved the way you would type them — absolute, or relative to
+wherever you are in the checkout. Repositories are identified by their git
+remote rather than their path, so a checkout that moves, or one that lives at
+different paths on two machines, stays a single repository. Files that have
+since been deleted or renamed keep their history, which is the case where this
+is worth the most.
+
+This is a capability the reviewed product does not have; the reasoning is in
+[`docs/CRITIQUE.md`](docs/CRITIQUE.md).
 
 ### Desktop shortcuts
 
@@ -105,6 +132,9 @@ confirm an install works without guessing at the shortcut.
 - **Hybrid search** — SQLite FTS5 BM25 blended with on-device embeddings,
   fused by Reciprocal Rank Fusion, with recency as a third ranked list.
   Matched words are highlighted; hits found only by meaning are labelled.
+- **Code archaeology** — conversations are attached to the repository and files
+  they touched, so `inv why <path>` returns the threads that produced a file.
+  Repositories are keyed by git remote, so a moved checkout stays one repo.
 - **Speaker attribution** across all six formats.
 - **Quick capture** that immediately matches a new thought against everything
   already indexed.

@@ -4,6 +4,7 @@ use crate::db;
 use crate::embed::{self, encode_vector, Embedder, HashingEmbedder, LsaEmbedder};
 use crate::keychain::{self, KeyProvider};
 use crate::model::*;
+use crate::repo;
 use crate::search::{self, SearchQuery, SearchResponse};
 use crate::sources::{self, ScanContext};
 use crate::vectors::{IvfIndex, VectorCache, VectorSet};
@@ -85,6 +86,38 @@ pub struct RetentionOption {
     /// Estimated on-disk cost of choosing this window.
     pub bytes: i64,
     pub selected: bool,
+}
+
+/// A repository the index has conversations for.
+#[derive(Debug, Clone)]
+pub struct RepoSummary {
+    pub key: String,
+    pub name: String,
+    /// Where it was last seen. May no longer exist.
+    pub root: PathBuf,
+    pub remote: Option<String>,
+    pub conversations: i64,
+    pub files: i64,
+    pub last_activity: i64,
+}
+
+/// One conversation that touched a given file.
+#[derive(Debug, Clone)]
+pub struct FileHit {
+    pub conversation: Conversation,
+    /// How often the conversation named the file — a rough stand-in for how
+    /// central it was to the work.
+    pub mentions: i64,
+}
+
+/// What is known about a file's history in the index.
+#[derive(Debug, Clone, Default)]
+pub struct FileHistory {
+    /// `None` when the path is not inside any repository.
+    pub repo: Option<repo::RepoRef>,
+    /// The path, relative to the repository root.
+    pub path: String,
+    pub hits: Vec<FileHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,12 +412,70 @@ impl Inventory {
         )?;
 
         self.write_embedding(id, &format!("{}\n{}", c.title, body))?;
+        self.link_repo(id, c, &body)?;
 
         Ok(if existing.is_some() {
             Upsert::Updated
         } else {
             Upsert::Inserted
         })
+    }
+
+    /// Attach a conversation to the repository and files it touched.
+    ///
+    /// Never fatal: a conversation that cannot be placed is still fully
+    /// searchable by text, and failing an index pass over a repo lookup would
+    /// trade the feature that works for the one that is a best effort.
+    fn link_repo(&self, id: i64, c: &Conversation, body: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM conversation_file WHERE conversation_id = ?1",
+            [id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM conversation_repo WHERE conversation_id = ?1",
+            [id],
+        )?;
+
+        let located = c
+            .project_path
+            .as_deref()
+            .and_then(repo::resolve)
+            .map(|r| (r, repo::Origin::Recorded))
+            .or_else(|| repo::infer(body).map(|r| (r, repo::Origin::Inferred)));
+        let Some((repo_ref, origin)) = located else {
+            return Ok(());
+        };
+
+        let repo_id = self.upsert_repo(&repo_ref)?;
+        self.conn.execute(
+            "INSERT INTO conversation_repo(conversation_id, repo_id, origin) VALUES (?1,?2,?3)",
+            rusqlite::params![id, repo_id, origin.as_str()],
+        )?;
+
+        // Only hand the extractor a root it can actually test paths against.
+        let root = repo_ref.root.is_dir().then_some(repo_ref.root.as_path());
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO conversation_file(conversation_id, repo_id, path, mentions)
+             VALUES (?1,?2,?3,?4)",
+        )?;
+        for (path, mentions) in repo::extract_paths(body, root) {
+            stmt.execute(rusqlite::params![id, repo_id, path, mentions])?;
+        }
+        Ok(())
+    }
+
+    fn upsert_repo(&self, r: &repo::RepoRef) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO repos(key, root, remote, name) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(key) DO UPDATE SET
+                root = excluded.root, remote = excluded.remote, name = excluded.name",
+            rusqlite::params![r.key, r.root.to_string_lossy(), r.remote, r.name],
+        )?;
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM repos WHERE key = ?1", [&r.key], |row| {
+                row.get(0)
+            })?)
     }
 
     fn write_embedding(&self, id: i64, text: &str) -> Result<()> {
@@ -677,6 +768,104 @@ impl Inventory {
     }
 
     // --- reading -----------------------------------------------------------
+
+    /// Every repository the index has seen, most conversations first.
+    pub fn repos(&self) -> Result<Vec<RepoSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.key, r.name, r.root, r.remote,
+                    COUNT(DISTINCT cr.conversation_id),
+                    (SELECT COUNT(DISTINCT cf.path)
+                       FROM conversation_file cf WHERE cf.repo_id = r.id),
+                    MAX(c.updated_at)
+             FROM repos r
+             JOIN conversation_repo cr ON cr.repo_id = r.id
+             JOIN conversations c      ON c.id = cr.conversation_id
+             GROUP BY r.id
+             ORDER BY COUNT(DISTINCT cr.conversation_id) DESC, r.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RepoSummary {
+                key: row.get(0)?,
+                name: row.get(1)?,
+                root: row.get::<_, String>(2)?.into(),
+                remote: row.get(3)?,
+                conversations: row.get(4)?,
+                files: row.get(5)?,
+                last_activity: row.get(6)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// The conversations that touched a file, most recently active first.
+    ///
+    /// `path` is resolved the way a developer would type it: absolute, or
+    /// relative to `from` (normally the current directory). The repository is
+    /// discovered from the path itself, so this works from anywhere inside a
+    /// checkout without naming the repo.
+    pub fn history_for_path(&self, path: &Path, from: &Path, limit: usize) -> Result<FileHistory> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            from.join(path)
+        };
+        let Some(repo_ref) = repo::discover(&absolute) else {
+            return Ok(FileHistory::default());
+        };
+        let Ok(relative) = absolute.strip_prefix(&repo_ref.root) else {
+            return Ok(FileHistory::default());
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+
+        let repo_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM repos WHERE key = ?1",
+                [&repo_ref.key],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(repo_id) = repo_id else {
+            return Ok(FileHistory {
+                repo: Some(repo_ref),
+                path: relative,
+                hits: Vec::new(),
+            });
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.source, c.external_id, c.title, c.project_path, c.git_branch,
+                    c.started_at, c.updated_at, c.message_count, cf.mentions
+             FROM conversation_file cf
+             JOIN conversations c ON c.id = cf.conversation_id
+             WHERE cf.repo_id = ?1 AND cf.path = ?2
+             ORDER BY c.updated_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo_id, relative, limit as i64], |row| {
+            let source: String = row.get(1)?;
+            Ok(FileHit {
+                conversation: Conversation {
+                    id: row.get(0)?,
+                    source: source.parse().unwrap_or(SourceId::ClaudeCode),
+                    external_id: row.get(2)?,
+                    title: row.get(3)?,
+                    project_path: row.get(4)?,
+                    git_branch: row.get(5)?,
+                    started_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    message_count: row.get(8)?,
+                },
+                mentions: row.get(9)?,
+            })
+        })?;
+
+        Ok(FileHistory {
+            repo: Some(repo_ref),
+            path: relative,
+            hits: rows.flatten().collect(),
+        })
+    }
 
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResponse> {
         self.with_vectors(|cache| search::search(&self.conn, cache, self.embedder.as_ref(), query))?
