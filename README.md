@@ -1,5 +1,7 @@
 # rusty_inventrory
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_inventrory`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_inventrory) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 A Rust implementation of [Inventory](https://www.myinventory.site) — one
 private index for every AI coding conversation on your machine.
 
